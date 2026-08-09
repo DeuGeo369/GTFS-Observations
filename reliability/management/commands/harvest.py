@@ -6,6 +6,9 @@ the rows, and it would bias any average towards long-range predictions), each
 trip-stop is upserted on its natural key so the row always holds the most recent
 report. That is the closest thing the feed gives us to a realised arrival.
 
+Every poll attempt is logged, successful or not, so coverage gaps can be
+measured rather than assumed.
+
 Usage:
     python manage.py harvest --once            # single poll, for testing
     python manage.py harvest                   # continuous, 60s interval
@@ -18,9 +21,10 @@ from datetime import datetime, timezone
 import requests
 from django.core.management.base import BaseCommand
 from django.db import transaction
+
 from google.transit import gtfs_realtime_pb2
 
-from reliability.models import HarvestRun, Observation
+from reliability.models import HarvestRun, Observation, Poll
 
 URL = "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses"
 
@@ -74,6 +78,9 @@ class Command(BaseCommand):
                 except Exception as exc:
                     run.errors += 1
                     run.save(update_fields=["errors"])
+                    # Log the failure too: a poll that failed is a poll's worth
+                    # of coverage lost, and it needs to be visible.
+                    Poll.objects.create(ok=False, error=str(exc)[:255])
                     self.stderr.write(self.style.WARNING(f"poll failed: {exc}"))
 
                 if opts["once"]:
@@ -100,9 +107,8 @@ class Command(BaseCommand):
 
         # Deduplicate within the poll. Postgres cannot update the same row twice
         # in one ON CONFLICT statement, and the feed does contain repeated keys:
-        # trips where stop_sequence is absent (protobuf then returns 0 for all
-        # of them), and loop routes that call at the same stop more than once.
-        # Last occurrence wins.
+        # loop routes calling at the same stop more than once, and occasionally
+        # trips where stop_sequence is absent. Last occurrence wins.
         seen = {}
         total_updates = 0
         no_sequence = 0
@@ -164,5 +170,8 @@ class Command(BaseCommand):
         run.last_feed_ts = datetime.fromtimestamp(feed.header.timestamp,
                                                   timezone.utc)
         run.save(update_fields=["polls", "observations", "last_feed_ts"])
+
+        Poll.objects.create(feed_ts=feed.header.timestamp, rows=len(rows),
+                            ok=True)
 
         return len(rows), duplicates, no_sequence

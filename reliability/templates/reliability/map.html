@@ -8,14 +8,13 @@
 <style>
   :root{
     --ink:#12181f; --muted:#5b6672; --line:#dfe4ea; --bg:#f5f7f9;
-    --good:#2e7d32; --ok:#f9a825; --bad:#ef6c00; --worst:#c62828; --grey:#9aa5b1;
   }
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--bg)}
   header{padding:14px 20px;background:#fff;border-bottom:1px solid var(--line)}
   h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
   header p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
-  .wrap{display:grid;grid-template-columns:320px 1fr;height:calc(100vh - 62px)}
+  .wrap{display:grid;grid-template-columns:330px 1fr;height:calc(100vh - 62px)}
   aside{background:#fff;border-right:1px solid var(--line);overflow-y:auto;padding:16px}
   #map{height:100%}
   .stat{padding:10px 0;border-bottom:1px solid var(--line)}
@@ -30,14 +29,14 @@
   button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
   .legend{display:flex;flex-direction:column;gap:5px;font-size:12.5px}
   .legend i{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;vertical-align:-1px}
+  .legend .meta{color:var(--muted);font-size:11.5px;margin-top:6px;line-height:1.45}
   .note{font-size:11.5px;color:var(--muted);line-height:1.5;border-top:1px solid var(--line);padding-top:12px;margin-top:16px}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   td{padding:4px 0;border-bottom:1px solid var(--line)}
   td:last-child{text-align:right;font-variant-numeric:tabular-nums}
-  .leaflet-popup-content{margin:12px 14px;font-size:12.5px}
-  .leaflet-popup-content b{font-size:13.5px}
   .pop td{padding:2px 0;border:0}
   .pop td:first-child{color:var(--muted);padding-right:14px}
+  .leaflet-popup-content{margin:12px 14px;font-size:12.5px}
 </style>
 </head>
 <body>
@@ -89,42 +88,66 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const map = L.map('map', {preferCanvas:true}).setView([-33.85, 151.06], 11);
+const map = L.map('map', {preferCanvas:true}).setView([-33.87, 151.05], 10);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
   attribution:'&copy; OpenStreetMap contributors &copy; CARTO', maxZoom:19
 }).addTo(map);
 
-let layer = null, metric = 'otp', peak = '';
+let layer = null, metric = 'otp', peak = '', meta = null;
 
-// Punctuality bands follow the NSW convention: on time is no more than 60s
-// early and no more than 359s late.
-const OTP_BANDS = [
-  [95, '#2e7d32', '95% and above'],
-  [90, '#f9a825', '90 – 95%'],
-  [80, '#ef6c00', '80 – 90%'],
-  [0,  '#c62828', 'below 80%']
-];
-const EWT_BANDS = [
-  [180, '#c62828', 'over 3 min added'],
-  [60,  '#ef6c00', '1 – 3 min added'],
-  [0,   '#f9a825', 'up to 1 min added'],
-  [-1e9,'#2e7d32', 'no excess wait']
-];
+// Sequential ramp for punctuality (higher is better), diverging for excess wait
+// (zero is meaningful — below it, passengers wait less than the timetable says).
+const SEQ  = ['#b2182b','#ef8a62','#fddbc7','#a6d96a','#1a9850'];
+const DIV  = ['#1a9850','#a6d96a','#fee08b','#f46d43','#a50026'];
+
+function classify(value, breaks){
+  // breaks are interior boundaries; returns a class index 0..breaks.length
+  let i = 0;
+  while (i < breaks.length && value >= breaks[i]) i++;
+  return i;
+}
 
 function colour(p){
   if (metric === 'otp'){
-    for (const [t,c] of OTP_BANDS) if (p.otp_pct >= t) return c;
-    return '#9aa5b1';
+    if (!meta || !meta.otp.breaks.length) return '#9aa5b1';
+    return SEQ[Math.min(SEQ.length - 1, classify(p.otp_pct, meta.otp.breaks))];
   }
-  if (p.ewt_s === null) return '#9aa5b1';   // grey = not measured, not good
-  for (const [t,c] of EWT_BANDS) if (p.ewt_s >= t) return c;
-  return '#9aa5b1';
+  if (p.ewt_s === null) return '#9aa5b1';        // grey = not measured
+  if (!meta || !meta.ewt.breaks.length) return '#9aa5b1';
+  return DIV[Math.min(DIV.length - 1, classify(p.ewt_s, meta.ewt.breaks))];
 }
 
 function drawLegend(){
-  const bands = metric === 'otp' ? OTP_BANDS : EWT_BANDS;
-  let html = bands.map(b => `<div><i style="background:${b[1]}"></i>${b[2]}</div>`).join('');
-  html += `<div><i style="background:#9aa5b1"></i>insufficient data</div>`;
+  if (!meta) return;
+  const isOtp = metric === 'otp';
+  const m = isOtp ? meta.otp : meta.ewt;
+  const ramp = isOtp ? SEQ : DIV;
+  const fmt = isOtp ? (v => v + '%') : (v => (v/60).toFixed(1) + ' min');
+
+  const bounds = [m.min, ...m.breaks, m.max];
+  let html = '';
+  for (let i = 0; i < m.breaks.length + 1; i++){
+    html += `<div><i style="background:${ramp[Math.min(ramp.length-1,i)]}"></i>` +
+            `${fmt(bounds[i])} – ${fmt(bounds[i+1])}</div>`;
+  }
+  html += `<div><i style="background:#9aa5b1"></i>not measured</div>`;
+
+  // Classification is quantile-based, so the legend has to say so - otherwise a
+  // reader assumes equal intervals and misreads the spread.
+  html += `<div class="meta">Five equal-count classes over the ${meta.served.toLocaleString()} ` +
+          `segments displayed. Class widths are unequal by design.`;
+  if (isOtp){
+    html += ` The 95% NSW target sits above this range: ` +
+            `<b>${m.pct_meeting_target}%</b> of segments meet it.`;
+  } else {
+    html += ` Negative values mean passengers waited less than the timetable implies.`;
+  }
+  if (meta.sampled){
+    html += ` Showing an even 1-in-${meta.sample_stride} sample of ` +
+            `${meta.matching.toLocaleString()} matching segments.`;
+  }
+  html += `</div>`;
+
   document.getElementById('legend').innerHTML = html;
 }
 
@@ -132,7 +155,7 @@ function popup(p){
   const dev = s => (s > 0 ? '+' : '') + s + 's';
   return `<b>${p.stop_name}</b><br><span style="color:#5b6672">Route ${p.route}` +
     ` · direction ${p.direction ?? '–'} · ${p.peak ? 'peak' : 'off-peak'}` +
-    `${p.is_terminus ? ' · terminus' : ''}</span>
+    `${p.is_terminus ? ' · origin' : ' · stop ' + p.stop_sequence}</span>
     <table class="pop">
       <tr><td>On time</td><td>${p.otp_pct}%</td></tr>
       <tr><td>Early</td><td>${p.pct_early}%</td></tr>
@@ -140,31 +163,34 @@ function popup(p){
       <tr><td>Median deviation</td><td>${dev(p.median_deviation_s)}</td></tr>
       <tr><td>90th percentile</td><td>${dev(p.p90_deviation_s)}</td></tr>
       ${p.ewt_s !== null ? `<tr><td>Excess wait</td><td>${(p.ewt_s/60).toFixed(1)} min</td></tr>
+      <tr><td>Scheduled headway</td><td>${(p.sched_headway_s/60).toFixed(1)} min</td></tr>
+      <tr><td>Actual headway</td><td>${(p.actual_headway_s/60).toFixed(1)} min</td></tr>
       <tr><td>Bunching</td><td>${p.bunching_pct}%</td></tr>` : ''}
       <tr><td>Observations</td><td>${p.observations}</td></tr>
     </table>`;
 }
 
 async function load(){
-  const url = `/api/segments.geojson?limit=4000${peak ? '&peak=' + peak : ''}`;
+  const url = `/api/segments.geojson?limit=6000${peak ? '&peak=' + peak : ''}`;
   const data = await (await fetch(url)).json();
+  if (data.error){ console.error(data.error, data.traceback); return; }
 
+  meta = data.meta;
   if (layer) map.removeLayer(layer);
+
   layer = L.geoJSON(data, {
     pointToLayer: (f, latlng) => L.circleMarker(latlng, {
-      radius: 4 + Math.min(4, f.properties.observations / 60),
-      fillColor: colour(f.properties), color:'#fff', weight:1,
+      radius: 4 + Math.min(4, f.properties.observations / 80),
+      fillColor: colour(f.properties), color:'#fff', weight:.8,
       opacity:1, fillOpacity:.85
     }),
     onEachFeature: (f, l) => l.bindPopup(popup(f.properties))
   }).addTo(map);
 
-  const rows = data.features
-    .sort((a,b) => a.properties.otp_pct - b.properties.otp_pct)
-    .slice(0,10)
-    .map(f => `<tr><td>${f.properties.route} · ${f.properties.stop_name.slice(0,24)}</td>
+  document.querySelector('#worst tbody').innerHTML = data.features
+    .slice().sort((a,b) => a.properties.otp_pct - b.properties.otp_pct).slice(0,10)
+    .map(f => `<tr><td>${f.properties.route} · ${f.properties.stop_name.slice(0,22)}</td>
                <td>${f.properties.otp_pct}%</td></tr>`).join('');
-  document.querySelector('#worst tbody').innerHTML = rows;
 
   drawLegend();
 }
@@ -186,19 +212,17 @@ async function loadSummary(){
     `${s.volume.routes} routes. ${s.performance.segments_usable.toLocaleString()} of ` +
     `${s.performance.segments_total.toLocaleString()} segments met the minimum ` +
     `observation threshold; the rest are excluded, not shown as zero. ` +
+    `${s.performance.meeting_target.toLocaleString()} segments meet the 95% target. ` +
     `${s.coverage.polls_24h} polls in the last 24 hours, ` +
-    `${s.coverage.failed_polls_24h} failed.` +
-    (s.regularity.punctual_but_irregular > 0
-      ? ` <b>${s.regularity.punctual_but_irregular}</b> segments meet a 90% punctuality
-         target while adding over two minutes of excess wait.` : '') +
-    `<br><br>${s.coverage.note}`;
+    `${s.coverage.failed_polls_24h} failed.<br><br>${s.coverage.note}`;
 }
 
 function setMetric(m){
   metric = m;
   document.getElementById('b-otp').className = m==='otp' ? 'on' : '';
   document.getElementById('b-ewt').className = m==='ewt' ? 'on' : '';
-  load();
+  if (layer) layer.setStyle(f => ({fillColor: colour(f.properties)}));
+  drawLegend();
 }
 function setPeak(p){
   peak = p;

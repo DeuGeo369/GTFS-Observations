@@ -1,18 +1,27 @@
 """Poll the TfNSW GTFS-Realtime bus feed and upsert trip-stop observations.
 
-The feed re-reports every active trip on every poll, with the prediction error
-shrinking as the vehicle approaches. Rather than storing every poll (roughly 50x
-the rows, and it would bias any average towards long-range predictions), each
-trip-stop is upserted on its natural key so the row always holds the most recent
-report. That is the closest thing the feed gives us to a realised arrival.
+Each poll returns a prediction for *every* remaining stop on *every* active
+trip — around 223,000 stop-time updates during weekday peak. The great majority
+are predictions for stops the vehicle will not reach for half an hour or more,
+and every one of them will be re-reported dozens of times before the bus
+actually arrives.
 
-Every poll attempt is logged, successful or not, so coverage gaps can be
-measured rather than assumed.
+Writing all of them is discarded work: it multiplied database write volume by
+roughly five, pushed each poll past eight minutes, and generated dead tuples
+faster than autovacuum could reclaim them. It also produced *worse* data, since
+distant predictions sat in the table until a later poll happened to overwrite
+them.
+
+So only updates whose predicted arrival falls inside a window around the present
+moment are persisted. Those are the reports made close enough to the event to
+approximate a realised arrival. Anything further out is skipped and will be
+picked up on a later poll as the vehicle approaches.
 
 Usage:
-    python manage.py harvest --once            # single poll, for testing
-    python manage.py harvest                   # continuous, 60s interval
-    python manage.py harvest --interval 30     # faster polling
+    python manage.py harvest --once
+    python manage.py harvest
+    python manage.py harvest --window 900 --interval 60
+    python manage.py harvest --no-filter        # old behaviour, for comparison
 """
 import os
 import time
@@ -38,15 +47,26 @@ UPDATE_FIELDS = [
     "trip_relationship", "feed_ts",
 ]
 
+# Look further back than forward. A stop-time that has just passed carries the
+# best available estimate of what actually happened; one predicted 15 minutes
+# out will be revised many times before it matters.
+LOOKBACK_S = 900
+LOOKAHEAD_S = 300
+
 
 class Command(BaseCommand):
     help = "Harvest GTFS-Realtime trip updates into the Observation table"
 
     def add_arguments(self, parser):
-        parser.add_argument("--interval", type=int, default=60,
-                            help="seconds between polls (default 60)")
-        parser.add_argument("--once", action="store_true",
-                            help="poll once and exit")
+        parser.add_argument("--interval", type=int, default=60)
+        parser.add_argument("--once", action="store_true")
+        parser.add_argument("--lookback", type=int, default=LOOKBACK_S,
+                            help="seconds behind now to accept (default 900)")
+        parser.add_argument("--lookahead", type=int, default=LOOKAHEAD_S,
+                            help="seconds ahead of now to accept (default 300)")
+        parser.add_argument("--no-filter", action="store_true",
+                            help="persist every stop-time update, as before")
+        parser.add_argument("--batch", type=int, default=10000)
 
     # ------------------------------------------------------------------
     def handle(self, *args, **opts):
@@ -61,57 +81,64 @@ class Command(BaseCommand):
         session.headers["Authorization"] = f"apikey {key}"
 
         run = HarvestRun.objects.create()
-        self.stdout.write(f"harvest run {run.id} started; Ctrl+C to stop")
+        mode = "all updates" if opts["no_filter"] else (
+            f"-{opts['lookback']}s / +{opts['lookahead']}s window")
+        self.stdout.write(f"harvest run {run.id} started ({mode}); Ctrl+C to stop")
 
         try:
             while True:
                 started = time.time()
                 try:
-                    written, dupes, no_seq = self.poll(session, run)
-                    msg = (f"{datetime.now():%H:%M:%S}  {written:>6,} rows  "
-                           f"(poll {run.polls}, cumulative {run.observations:,})")
-                    if dupes:
-                        msg += f"  [{dupes} duplicate keys collapsed]"
-                    if no_seq:
-                        msg += f"  [{no_seq} without stop_sequence]"
-                    self.stdout.write(msg)
+                    stats = self.poll(session, run, opts)
+                    elapsed = time.time() - started
+                    self.stdout.write(
+                        f"{datetime.now():%H:%M:%S}  "
+                        f"{stats['written']:>7,} written  "
+                        f"{stats['skipped']:>7,} skipped  "
+                        f"{elapsed:>5.1f}s  "
+                        f"(poll {run.polls}, total {run.observations:,})")
+                    if elapsed > opts["interval"]:
+                        self.stderr.write(self.style.WARNING(
+                            f"  poll took longer than the {opts['interval']}s "
+                            f"interval - effective polling rate is degraded"))
                 except Exception as exc:
                     run.errors += 1
                     run.save(update_fields=["errors"])
-                    # Log the failure too: a poll that failed is a poll's worth
-                    # of coverage lost, and it needs to be visible.
                     Poll.objects.create(ok=False, error=str(exc)[:255])
                     self.stderr.write(self.style.WARNING(f"poll failed: {exc}"))
 
                 if opts["once"]:
                     break
-
                 time.sleep(max(0.0, opts["interval"] - (time.time() - started)))
+
         except KeyboardInterrupt:
             self.stdout.write(self.style.SUCCESS(
                 f"\nstopped after {run.polls} polls, "
                 f"{run.observations:,} observations, {run.errors} errors"))
 
     # ------------------------------------------------------------------
-    def poll(self, session, run):
+    def poll(self, session, run, opts):
         resp = session.get(URL, timeout=45)
         resp.raise_for_status()
 
         feed = gtfs_realtime_pb2.FeedMessage()
         feed.ParseFromString(resp.content)
 
-        age = datetime.now(timezone.utc).timestamp() - feed.header.timestamp
+        now = datetime.now(timezone.utc).timestamp()
+        age = now - feed.header.timestamp
         if age > 300:
             self.stderr.write(self.style.WARNING(
                 f"feed header is {age:.0f}s old - possible upstream outage"))
 
-        # Deduplicate within the poll. Postgres cannot update the same row twice
-        # in one ON CONFLICT statement, and the feed does contain repeated keys:
-        # loop routes calling at the same stop more than once, and occasionally
-        # trips where stop_sequence is absent. Last occurrence wins.
+        earliest = now - opts["lookback"]
+        latest = now + opts["lookahead"]
+        use_filter = not opts["no_filter"]
+
+        # Deduplicate within the poll: Postgres cannot update the same row twice
+        # in one ON CONFLICT statement, and the feed repeats keys for loop routes
+        # that call at the same stop more than once. Last occurrence wins.
         seen = {}
-        total_updates = 0
-        no_sequence = 0
+        total = skipped = 0
 
         for entity in feed.entity:
             tu = entity.trip_update
@@ -123,12 +150,20 @@ class Command(BaseCommand):
             trip_rel = TRIP_REL.get(trip.schedule_relationship, "")
 
             for stu in tu.stop_time_update:
-                total_updates += 1
-                if not stu.HasField("stop_sequence"):
-                    no_sequence += 1
+                total += 1
 
                 arr = stu.arrival if stu.HasField("arrival") else None
                 dep = stu.departure if stu.HasField("departure") else None
+
+                when = (arr.time if arr and arr.time else
+                        dep.time if dep and dep.time else None)
+
+                if use_filter:
+                    # No timestamp at all means nothing can be said about when
+                    # this happened, so it cannot contribute to punctuality.
+                    if when is None or not (earliest <= when <= latest):
+                        skipped += 1
+                        continue
 
                 key = (trip.trip_id, trip.start_date or "", stu.stop_id,
                        stu.stop_sequence)
@@ -153,17 +188,17 @@ class Command(BaseCommand):
                 )
 
         rows = list(seen.values())
-        duplicates = total_updates - len(rows)
 
-        with transaction.atomic():
-            Observation.objects.bulk_create(
-                rows,
-                batch_size=5000,
-                update_conflicts=True,
-                unique_fields=["trip_id", "service_date", "stop_id",
-                               "stop_sequence"],
-                update_fields=UPDATE_FIELDS,
-            )
+        if rows:
+            with transaction.atomic():
+                Observation.objects.bulk_create(
+                    rows,
+                    batch_size=opts["batch"],
+                    update_conflicts=True,
+                    unique_fields=["trip_id", "service_date", "stop_id",
+                                   "stop_sequence"],
+                    update_fields=UPDATE_FIELDS,
+                )
 
         run.polls += 1
         run.observations += len(rows)
@@ -174,4 +209,5 @@ class Command(BaseCommand):
         Poll.objects.create(feed_ts=feed.header.timestamp, rows=len(rows),
                             ok=True)
 
-        return len(rows), duplicates, no_sequence
+        return {"written": len(rows), "skipped": skipped, "total": total,
+                "duplicates": total - skipped - len(rows)}

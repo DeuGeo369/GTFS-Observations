@@ -6,15 +6,14 @@
 <title>Bus Service Reliability Observatory — Sydney</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
-  :root{
-    --ink:#12181f; --muted:#5b6672; --line:#dfe4ea; --bg:#f5f7f9;
-  }
+  :root{ --ink:#12181f; --muted:#5b6672; --line:#dfe4ea; --bg:#f5f7f9; }
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--bg)}
   header{padding:14px 20px;background:#fff;border-bottom:1px solid var(--line)}
   h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
   header p{margin:3px 0 0;color:var(--muted);font-size:12.5px}
-  .wrap{display:grid;grid-template-columns:330px 1fr;height:calc(100vh - 62px)}
+  .disclaimer{padding:8px 20px;background:#FFF4E5;border-bottom:1px solid #F0D9B5;font-size:12.5px;color:#7A5B22}
+  .wrap{display:grid;grid-template-columns:330px 1fr;height:calc(100vh - 100px)}
   aside{background:#fff;border-right:1px solid var(--line);overflow-y:auto;padding:16px}
   #map{height:100%}
   .stat{padding:10px 0;border-bottom:1px solid var(--line)}
@@ -27,6 +26,7 @@
   .ctrl{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
   button{font:inherit;font-size:12.5px;padding:6px 11px;border:1px solid var(--line);background:#fff;border-radius:6px;cursor:pointer;color:var(--ink)}
   button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+  button:disabled{opacity:.4;cursor:not-allowed}
   .legend{display:flex;flex-direction:column;gap:5px;font-size:12.5px}
   .legend i{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:8px;vertical-align:-1px}
   .legend .meta{color:var(--muted);font-size:11.5px;margin-top:6px;line-height:1.45}
@@ -37,7 +37,6 @@
   .pop td{padding:2px 0;border:0}
   .pop td:first-child{color:var(--muted);padding-right:14px}
   .leaflet-popup-content{margin:12px 14px;font-size:12.5px}
-  .disclaimer{padding:8px 20px;background:#FFF4E5;border-bottom:1px solid #F0D9B5;font-size:12.5px;color:#7A5B22}
 </style>
 </head>
 <body>
@@ -56,10 +55,7 @@
 
 <div class="wrap">
   <aside>
-    <div class="stat">
-      <div class="n" id="otp">—</div>
-      <div class="l">On time</div>
-    </div>
+    <div class="stat"><div class="n" id="otp">—</div><div class="l">On time</div></div>
     <div class="stat split">
       <div><div class="n" id="early">—</div><div class="l">Early</div></div>
       <div><div class="n" id="late">—</div><div class="l">Late</div></div>
@@ -82,6 +78,13 @@
       <button id="p-off" onclick="setPeak('false')">Off-peak</button>
     </div>
 
+    <h2>Excess wait: day type</h2>
+    <div class="ctrl">
+      <button id="d-all" class="on" onclick="setDays('all')">All days</button>
+      <button id="d-wd" onclick="setDays('weekday')">Weekday</button>
+      <button id="d-we" onclick="setDays('weekend')">Weekend</button>
+    </div>
+
     <h2>Legend</h2>
     <div class="legend" id="legend"></div>
 
@@ -101,15 +104,14 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
   attribution:'&copy; OpenStreetMap contributors &copy; CARTO', maxZoom:19
 }).addTo(map);
 
-let layer = null, metric = 'otp', peak = '', meta = null;
+let layer = null, metric = 'otp', peak = '', days = 'all', meta = null;
 
 // Sequential ramp for punctuality (higher is better), diverging for excess wait
-// (zero is meaningful — below it, passengers wait less than the timetable says).
-const SEQ  = ['#b2182b','#ef8a62','#fddbc7','#a6d96a','#1a9850'];
-const DIV  = ['#1a9850','#a6d96a','#fee08b','#f46d43','#a50026'];
+// (zero is a real boundary: below it, passengers wait less than timetabled).
+const SEQ = ['#b2182b','#ef8a62','#fddbc7','#a6d96a','#1a9850'];
+const DIV = ['#1a9850','#a6d96a','#fee08b','#f46d43','#a50026'];
 
 function classify(value, breaks){
-  // breaks are interior boundaries; returns a class index 0..breaks.length
   let i = 0;
   while (i < breaks.length && value >= breaks[i]) i++;
   return i;
@@ -118,21 +120,30 @@ function classify(value, breaks){
 function colour(p){
   if (metric === 'otp'){
     if (!meta || !meta.otp.breaks.length) return '#9aa5b1';
-    return SEQ[Math.min(SEQ.length - 1, classify(p.otp_pct, meta.otp.breaks))];
+    return SEQ[Math.min(SEQ.length-1, classify(p.otp_pct, meta.otp.breaks))];
   }
   if (p.ewt_s === null) return '#9aa5b1';        // grey = not measured
   if (!meta || !meta.ewt.breaks.length) return '#9aa5b1';
-  return DIV[Math.min(DIV.length - 1, classify(p.ewt_s, meta.ewt.breaks))];
+  return DIV[Math.min(DIV.length-1, classify(p.ewt_s, meta.ewt.breaks))];
 }
 
 function drawLegend(){
   if (!meta) return;
   const isOtp = metric === 'otp';
   const m = isOtp ? meta.otp : meta.ewt;
+  const el = document.getElementById('legend');
+
+  if (!m.breaks.length){
+    el.innerHTML = `<div class="meta">No ${isOtp ? 'punctuality' : 'headway'}
+      data for this selection. Excess wait requires at least five headway
+      intervals at a stop on a given day.</div>`;
+    return;
+  }
+
   const ramp = isOtp ? SEQ : DIV;
   const fmt = isOtp ? (v => v + '%') : (v => (v/60).toFixed(1) + ' min');
-
   const bounds = [m.min, ...m.breaks, m.max];
+
   let html = '';
   for (let i = 0; i < m.breaks.length + 1; i++){
     html += `<div><i style="background:${ramp[Math.min(ramp.length-1,i)]}"></i>` +
@@ -140,23 +151,25 @@ function drawLegend(){
   }
   html += `<div><i style="background:#9aa5b1"></i>not measured</div>`;
 
-  // Classification is quantile-based, so the legend has to say so - otherwise a
-  // reader assumes equal intervals and misreads the spread.
-  html += `<div class="meta">Five equal-count classes over the ${meta.served.toLocaleString()} ` +
-          `segments displayed. Class widths are unequal by design.`;
+  // Quantile classification has unequal class widths. A reader who assumes
+  // equal intervals will misread the spread, so the legend says which it is.
+  html += `<div class="meta">Five equal-count classes over the
+           ${meta.served.toLocaleString()} segments displayed. Class widths are
+           unequal by design.`;
   if (isOtp){
-    html += ` The 95% NSW target sits above this range: ` +
-            `<b>${m.pct_meeting_target}%</b> of segments meet it.`;
+    html += ` The 95% NSW target sits above this range:
+              <b>${m.pct_meeting_target}%</b> of segments meet it.`;
   } else {
-    html += ` Negative values mean passengers waited less than the timetable implies.`;
+    html += ` Negative values mean passengers waited less than the timetable
+              implies. Showing <b>${meta.day_filter === 'all' ? 'all days' :
+              meta.day_filter}</b>.`;
   }
   if (meta.sampled){
-    html += ` Showing an even 1-in-${meta.sample_stride} sample of ` +
-            `${meta.matching.toLocaleString()} matching segments.`;
+    html += ` Showing an even 1-in-${meta.sample_stride} sample of
+              ${meta.matching.toLocaleString()} matching segments.`;
   }
   html += `</div>`;
-
-  document.getElementById('legend').innerHTML = html;
+  el.innerHTML = html;
 }
 
 function popup(p){
@@ -170,16 +183,19 @@ function popup(p){
       <tr><td>Late</td><td>${p.pct_late}%</td></tr>
       <tr><td>Median deviation</td><td>${dev(p.median_deviation_s)}</td></tr>
       <tr><td>90th percentile</td><td>${dev(p.p90_deviation_s)}</td></tr>
-      ${p.ewt_s !== null ? `<tr><td>Excess wait</td><td>${(p.ewt_s/60).toFixed(1)} min</td></tr>
+      ${p.ewt_s !== null ? `
+      <tr><td>Excess wait</td><td>${(p.ewt_s/60).toFixed(1)} min</td></tr>
       <tr><td>Scheduled headway</td><td>${(p.sched_headway_s/60).toFixed(1)} min</td></tr>
       <tr><td>Actual headway</td><td>${(p.actual_headway_s/60).toFixed(1)} min</td></tr>
-      <tr><td>Bunching</td><td>${p.bunching_pct}%</td></tr>` : ''}
+      <tr><td>Bunching</td><td>${p.bunching_pct}%</td></tr>
+      <tr><td>Days measured</td><td>${p.headway_days ?? '–'}</td></tr>` : ''}
       <tr><td>Observations</td><td>${p.observations}</td></tr>
     </table>`;
 }
 
 async function load(){
-  const url = `/api/segments.geojson?limit=6000${peak ? '&peak=' + peak : ''}`;
+  const url = `/api/segments.geojson?limit=6000&days=${days}` +
+              (peak ? '&peak=' + peak : '');
   const data = await (await fetch(url)).json();
   if (data.error){ console.error(data.error, data.traceback); return; }
 
@@ -214,14 +230,21 @@ async function loadSummary(){
   document.getElementById('segs').textContent  =
     s.performance.segments_usable.toLocaleString();
 
+  let dayLine = '';
+  const bt = s.regularity.by_day_type || {};
+  const parts = Object.entries(bt).map(([k,v]) =>
+    `${k} ${(v.mean_ewt_s/60).toFixed(1)} min over ${v.days} day(s)`);
+  if (parts.length) dayLine = ` Mean excess wait by day type: ${parts.join(', ')}.`;
+
   document.getElementById('coverage').innerHTML =
     `<b>Coverage.</b> Window ${s.window.start} to ${s.window.end}. ` +
     `${s.volume.observations_stored.toLocaleString()} observations across ` +
     `${s.volume.routes} routes. ${s.performance.segments_usable.toLocaleString()} of ` +
     `${s.performance.segments_total.toLocaleString()} segments met the minimum ` +
     `observation threshold; the rest are excluded, not shown as zero. ` +
-    `${s.performance.meeting_target.toLocaleString()} segments meet the 95% target. ` +
-    `${s.coverage.polls_24h} polls in the last 24 hours, ` +
+    `Headway metrics cover ${s.regularity.headway_service_days} service day(s).` +
+    dayLine +
+    ` ${s.coverage.polls_24h} polls in the last 24 hours, ` +
     `${s.coverage.failed_polls_24h} failed.<br><br>${s.coverage.note}`;
 }
 
@@ -237,6 +260,14 @@ function setPeak(p){
   document.getElementById('p-all').className  = p===''      ? 'on' : '';
   document.getElementById('p-peak').className = p==='true'  ? 'on' : '';
   document.getElementById('p-off').className  = p==='false' ? 'on' : '';
+  load();
+}
+function setDays(d){
+  days = d;
+  document.getElementById('d-all').className = d==='all'     ? 'on' : '';
+  document.getElementById('d-wd').className  = d==='weekday' ? 'on' : '';
+  document.getElementById('d-we').className  = d==='weekend' ? 'on' : '';
+  if (metric !== 'ewt') setMetric('ewt');
   load();
 }
 

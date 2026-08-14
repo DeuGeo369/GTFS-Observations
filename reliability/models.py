@@ -38,9 +38,9 @@ class StopTime(models.Model):
     stop = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name="stop_times")
     stop_sequence = models.IntegerField()
 
-    # Seconds since the start of the service day, NOT a time of day.
-    # GTFS legitimately contains values like 25:14:00 for trips running past
-    # midnight. A TimeField would reject or wrap those, silently deleting every
+    # Seconds since the start of the service day, NOT a time of day. GTFS
+    # legitimately contains values like 25:14:00 for trips running past
+    # midnight; a TimeField would reject or wrap those, silently deleting every
     # late-night service from the analysis.
     arrival_s = models.IntegerField(null=True)
     departure_s = models.IntegerField(null=True)
@@ -72,8 +72,7 @@ class Poll(models.Model):
 
     HarvestRun only counts errors, which cannot tell you *when* data was lost.
     Coverage gaps are the one defect that cannot be repaired after the fact, so
-    every attempt is timestamped. This is what makes the coverage statement in
-    the method note a measurement rather than an assurance.
+    every attempt is timestamped.
     """
     polled_at = models.DateTimeField(auto_now_add=True, db_index=True)
     feed_ts = models.BigIntegerField(null=True)
@@ -85,8 +84,8 @@ class Poll(models.Model):
 class Observation(models.Model):
     """One realtime arrival record per trip-stop, overwritten on each poll."""
     # Deliberately NOT a ForeignKey to Trip: the feed carries added and
-    # replacement trips that do not exist in the static bundle. A FK would
-    # reject exactly the trips worth investigating.
+    # replacement trips absent from the static bundle, and a FK would reject
+    # exactly the trips worth investigating.
     trip_id = models.CharField(max_length=64)
     service_date = models.CharField(max_length=8)
     stop_id = models.CharField(max_length=64)
@@ -123,13 +122,12 @@ class Observation(models.Model):
 
 # ------------------------------------------------------------------- curated
 class SegmentPerformance(models.Model):
-    """Aggregated punctuality and headway regularity for one
-    route / direction / stop / period.
+    """Aggregated punctuality for one route / direction / stop / period.
 
-    A "segment" is a single stop on a single route in one direction, split into
-    peak and off-peak. That granularity matters: a corridor can look acceptable
-    overall while one stop in the AM peak fails consistently, and averaging
-    across the route hides it.
+    Rebuilt from scratch by `aggregate`. The headway fields on this model are a
+    denormalised rollup across every day held in DailyHeadway, recomputed at the
+    end of each `headways` run. The per-day detail lives in DailyHeadway; this
+    is the summary the map reads by default.
     """
     route_id = models.CharField(max_length=64)
     route_short_name = models.CharField(max_length=32, blank=True)
@@ -152,14 +150,14 @@ class SegmentPerformance(models.Model):
     p90_deviation_s = models.FloatField()
     worst_deviation_s = models.FloatField()
 
-    # Lowest stop_sequence seen. Sequence 1 means this is a route origin, where
-    # an "early arrival" is usually a vehicle berthing before its departure
-    # time rather than a service leaving early. Different problem, different
-    # remedy, and the distinction has to survive into the reporting.
+    # Lowest stop_sequence seen. Sequence 1 means a route origin, where an
+    # "early arrival" is usually a vehicle berthing before its departure time
+    # rather than a service leaving early.
     min_stop_sequence = models.IntegerField(null=True)
     is_terminus = models.BooleanField(default=False)
 
-    # --- headway regularity (populated by the headways command) ----------
+    # --- headway rollup, mean across all days in DailyHeadway -------------
+    headway_days = models.IntegerField(null=True)
     headway_observations = models.IntegerField(null=True)
     mean_scheduled_headway_s = models.FloatField(null=True)
     mean_actual_headway_s = models.FloatField(null=True)
@@ -167,8 +165,6 @@ class SegmentPerformance(models.Model):
     bunching_rate_pct = models.FloatField(null=True)
     gap_rate_pct = models.FloatField(null=True)
 
-    # Below the threshold the percentages are noise, not signal. Flagged rather
-    # than deleted so the excluded count can be reported.
     sufficient_sample = models.BooleanField()
 
     window_start = models.CharField(max_length=8)
@@ -192,3 +188,58 @@ class SegmentPerformance(models.Model):
         period = "peak" if self.is_peak else "off-peak"
         return (f"{self.route_short_name} dir {self.direction_id} "
                 f"@ {self.stop_id} ({period}): {self.otp_pct:.1f}%")
+
+
+class DailyHeadway(models.Model):
+    """Headway regularity for one segment on one service day.
+
+    Separate from SegmentPerformance for two reasons.
+
+    First, memory. Computing headways across the whole window at once exhausts a
+    2 GB instance; one day at a time fits comfortably. Because each day is
+    written as its own row rather than overwriting the last, days accumulate
+    instead of replacing one another.
+
+    Second, and more usefully, weekday and weekend service are different
+    products. Blending them into a single mean hides exactly the contrast worth
+    looking at, so `day_type` is stored and the API can filter on it.
+    """
+    WEEKDAY, SATURDAY, SUNDAY = "weekday", "saturday", "sunday"
+    DAY_TYPES = [(WEEKDAY, "Weekday"), (SATURDAY, "Saturday"), (SUNDAY, "Sunday")]
+
+    route_id = models.CharField(max_length=64)
+    route_short_name = models.CharField(max_length=32, blank=True)
+    direction_id = models.SmallIntegerField(null=True)
+    stop = models.ForeignKey(Stop, on_delete=models.CASCADE,
+                             related_name="daily_headways")
+    is_peak = models.BooleanField()
+
+    service_date = models.CharField(max_length=8, db_index=True)
+    day_type = models.CharField(max_length=8, choices=DAY_TYPES, db_index=True)
+
+    intervals = models.IntegerField()
+    mean_scheduled_headway_s = models.FloatField()
+    mean_actual_headway_s = models.FloatField()
+    excess_wait_time_s = models.FloatField()
+    bunching_rate_pct = models.FloatField()
+    gap_rate_pct = models.FloatField()
+
+    computed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["route_id", "direction_id", "stop", "is_peak",
+                        "service_date"],
+                name="uniq_daily_headway",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["service_date", "day_type"]),
+            models.Index(fields=["route_id", "stop", "service_date"]),
+            models.Index(fields=["excess_wait_time_s"]),
+        ]
+
+    def __str__(self):
+        return (f"{self.route_short_name} @ {self.stop_id} {self.service_date}: "
+                f"EWT {self.excess_wait_time_s:.0f}s")

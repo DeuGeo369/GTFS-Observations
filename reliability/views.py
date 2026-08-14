@@ -4,36 +4,31 @@
     /api/segments.geojson  segment performance as GeoJSON
     /api/summary.json      headline figures and coverage
 
-Two decisions here are worth reading before changing anything.
+Excess wait time can be requested for all days, weekdays only, or weekends only
+via ?days=all|weekday|weekend. The default rollup on SegmentPerformance is the
+mean across every day held; the filtered variants are computed from DailyHeadway
+on request, which is what makes a weekday-versus-weekend comparison possible.
 
-**Sampling must not be biased.** An earlier version ordered by punctuality and
-then truncated to a row limit. Once the result set exceeded the limit, the map
-served only the worst segments and silently dropped every good one — a map that
-looks plausible and is systematically wrong. Any limit is now applied to a
-deterministic modulo sample across the whole set, so the served subset has the
-same distribution as the full set.
-
-**Classification follows the data, not the target.** Fixed bands anchored at a
-95% target give no discrimination when the entire network sits below 95%:
-everything renders one colour and the map stops carrying information. Breaks are
-computed as quantiles of the values actually being displayed, and the target is
-shown as a reference line instead of as the top of the ramp.
+Geometry is stored in EPSG:7856 because every distance calculation needs metres.
+Reprojection to EPSG:4326 is done by PostGIS at this boundary rather than by
+Django's GDAL bindings in Python: one round trip instead of thousands of per-row
+transforms, using the PROJ installation already proven to resolve GDA2020.
 """
 import logging
 import traceback
 from datetime import timedelta
 
 from django.contrib.gis.db.models.functions import Transform
-from django.db.models import Sum
+from django.db.models import Avg, Count, Sum
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 
-from reliability.models import Observation, Poll, SegmentPerformance
+from reliability.models import (DailyHeadway, Observation, Poll,
+                                SegmentPerformance)
 
 log = logging.getLogger(__name__)
 
-# NSW convention: on time is no more than 60s early, no more than 359s late.
 OTP_TARGET = 95.0
 
 
@@ -42,17 +37,17 @@ def map_view(request):
 
 
 def _quantile_breaks(values, n_classes=5):
-    """Equal-count breaks. Returns the interior boundaries only."""
+    """Equal-count breaks. Returns interior boundaries only."""
     if not values:
         return []
     ordered = sorted(values)
     breaks = []
     for i in range(1, n_classes):
-        idx = int(round(i * len(ordered) / n_classes))
-        idx = max(0, min(len(ordered) - 1, idx))
+        idx = max(0, min(len(ordered) - 1,
+                         int(round(i * len(ordered) / n_classes))))
         breaks.append(round(ordered[idx], 1))
-    # Collapse duplicates: a heavily tied distribution can produce identical
-    # boundaries, which would create empty classes in the legend.
+    # Collapse duplicates: a heavily tied distribution would otherwise produce
+    # identical boundaries and empty classes in the legend.
     out = []
     for b in breaks:
         if not out or b > out[-1]:
@@ -60,16 +55,44 @@ def _quantile_breaks(values, n_classes=5):
     return out
 
 
+def _headway_by_day_type(day_filter):
+    """Per-segment headway means restricted to a day type.
+
+    Returns {} for 'all', in which case the caller uses the rollup already
+    stored on SegmentPerformance.
+    """
+    if day_filter not in ("weekday", "weekend"):
+        return {}
+
+    types = ([DailyHeadway.WEEKDAY] if day_filter == "weekday"
+             else [DailyHeadway.SATURDAY, DailyHeadway.SUNDAY])
+
+    agg = (DailyHeadway.objects
+           .filter(day_type__in=types)
+           .values("route_id", "direction_id", "stop_id", "is_peak")
+           .annotate(days=Count("service_date", distinct=True),
+                     ewt=Avg("excess_wait_time_s"),
+                     sched=Avg("mean_scheduled_headway_s"),
+                     actual=Avg("mean_actual_headway_s"),
+                     bunch=Avg("bunching_rate_pct")))
+
+    return {(a["route_id"], a["direction_id"], a["stop_id"], a["is_peak"]): a
+            for a in agg}
+
+
 def segments_geojson(request):
     """Segment performance as GeoJSON in EPSG:4326, with classification breaks.
 
-    Only segments meeting the observation threshold are served. A stop with four
-    observations and one early bus reads as 75% and would otherwise sit at the
-    top of any worst-performer list on nothing but noise.
+    Only segments meeting the observation threshold are served. Any row limit is
+    applied as a deterministic modulo sample across the whole ordered set, never
+    as a truncation of a sorted list: truncating after ordering by punctuality
+    would serve only the worst segments and produce a map that looks plausible
+    and is systematically wrong.
     """
     try:
         peak = request.GET.get("peak")
         route = request.GET.get("route")
+        days = request.GET.get("days", "all")
         limit = min(int(request.GET.get("limit", 6000)), 12000)
 
         qs = (SegmentPerformance.objects
@@ -83,24 +106,38 @@ def segments_geojson(request):
             qs = qs.filter(route_short_name=route)
 
         total = qs.count()
-
-        # Deterministic even sample rather than a truncation. Ordering by
-        # primary key keeps it stable between requests; the modulo stride keeps
-        # the sample representative rather than skewed to one tail.
         rows = list(qs.order_by("pk"))
         stride = max(1, -(-total // limit))       # ceiling division
         if stride > 1:
             rows = rows[::stride]
 
-        otp_values = [r.otp_pct for r in rows]
-        ewt_values = [r.excess_wait_time_s for r in rows
-                      if r.excess_wait_time_s is not None]
+        by_day = _headway_by_day_type(days)
 
-        features = []
+        features, otp_values, ewt_values = [], [], []
         for s in rows:
             g = s.geom4326
             if g is None:
                 continue
+
+            if by_day:
+                a = by_day.get((s.route_id, s.direction_id,
+                                s.stop_id, s.is_peak))
+                ewt = a["ewt"] if a else None
+                sched = a["sched"] if a else None
+                actual = a["actual"] if a else None
+                bunch = a["bunch"] if a else None
+                hdays = a["days"] if a else None
+            else:
+                ewt = s.excess_wait_time_s
+                sched = s.mean_scheduled_headway_s
+                actual = s.mean_actual_headway_s
+                bunch = s.bunching_rate_pct
+                hdays = s.headway_days
+
+            otp_values.append(s.otp_pct)
+            if ewt is not None:
+                ewt_values.append(ewt)
+
             features.append({
                 "type": "Feature",
                 "geometry": {"type": "Point",
@@ -119,16 +156,11 @@ def segments_geojson(request):
                     "observations": s.observations,
                     "is_terminus": s.is_terminus,
                     "stop_sequence": s.min_stop_sequence,
-                    "ewt_s": (round(s.excess_wait_time_s)
-                              if s.excess_wait_time_s is not None else None),
-                    "bunching_pct": (round(s.bunching_rate_pct, 1)
-                                     if s.bunching_rate_pct is not None else None),
-                    "sched_headway_s": (round(s.mean_scheduled_headway_s)
-                                        if s.mean_scheduled_headway_s is not None
-                                        else None),
-                    "actual_headway_s": (round(s.mean_actual_headway_s)
-                                         if s.mean_actual_headway_s is not None
-                                         else None),
+                    "ewt_s": round(ewt) if ewt is not None else None,
+                    "headway_days": hdays,
+                    "bunching_pct": round(bunch, 1) if bunch is not None else None,
+                    "sched_headway_s": round(sched) if sched is not None else None,
+                    "actual_headway_s": round(actual) if actual is not None else None,
                 },
             })
 
@@ -142,13 +174,15 @@ def segments_geojson(request):
                 "served": len(features),
                 "sampled": stride > 1,
                 "sample_stride": stride,
+                "day_filter": days,
                 "otp": {
                     "breaks": _quantile_breaks(otp_values),
                     "min": round(min(otp_values), 1) if otp_values else None,
                     "max": round(max(otp_values), 1) if otp_values else None,
                     "target": OTP_TARGET,
-                    "pct_meeting_target": (round(100 * above_target / len(otp_values), 1)
-                                           if otp_values else None),
+                    "pct_meeting_target": (
+                        round(100 * above_target / len(otp_values), 1)
+                        if otp_values else None),
                 },
                 "ewt": {
                     "breaks": _quantile_breaks(ewt_values),
@@ -177,13 +211,27 @@ def summary_json(request):
     to be trusted rather than checked.
     """
     segs = SegmentPerformance.objects.filter(sufficient_sample=True)
-    total_segs = SegmentPerformance.objects.count()
-
     agg = segs.aggregate(obs=Sum("observations"), ot=Sum("n_on_time"),
                          early=Sum("n_early"), late=Sum("n_late"))
     obs = agg["obs"] or 0
 
     with_ewt = segs.exclude(excess_wait_time_s__isnull=True)
+
+    by_type = {}
+    for dt, label in DailyHeadway.DAY_TYPES:
+        q = DailyHeadway.objects.filter(day_type=dt)
+        if not q.exists():
+            continue
+        a = q.aggregate(ewt=Avg("excess_wait_time_s"),
+                        bunch=Avg("bunching_rate_pct"),
+                        days=Count("service_date", distinct=True),
+                        segments=Count("id"))
+        by_type[dt] = {
+            "days": a["days"],
+            "segment_days": a["segments"],
+            "mean_ewt_s": round(a["ewt"], 1),
+            "mean_bunching_pct": round(a["bunch"], 1),
+        }
 
     since = timezone.now() - timedelta(hours=24)
     polls = Poll.objects.filter(polled_at__gte=since)
@@ -202,7 +250,7 @@ def summary_json(request):
         },
         "performance": {
             "segments_usable": segs.count(),
-            "segments_total": total_segs,
+            "segments_total": SegmentPerformance.objects.count(),
             "observations_analysed": obs,
             "otp_pct": round(100 * (agg["ot"] or 0) / obs, 1) if obs else None,
             "early_pct": round(100 * (agg["early"] or 0) / obs, 1) if obs else None,
@@ -212,10 +260,13 @@ def summary_json(request):
         },
         "regularity": {
             "segments_with_headway_data": with_ewt.count(),
+            "headway_service_days": DailyHeadway.objects.values(
+                "service_date").distinct().count(),
             "worse_than_timetable": with_ewt.filter(
                 excess_wait_time_s__gt=0).count(),
             "punctual_but_irregular": with_ewt.filter(
                 otp_pct__gte=90, excess_wait_time_s__gt=120).count(),
+            "by_day_type": by_type,
         },
         "coverage": {
             "polls_24h": polls.count(),

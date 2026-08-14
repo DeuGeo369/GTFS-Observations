@@ -7,3 +7,5 @@ __pycache__/
 *.zip 
 *.pb 
 *.parquet 
+staticfiles/ 
+.cache/ 

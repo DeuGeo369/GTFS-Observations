@@ -3,4 +3,7 @@
 *.zip
 *.pb
 __pycache__/
-*.pyc
+*.pyc*.dump 
+*.zip 
+*.pb 
+*.parquet 

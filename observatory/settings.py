@@ -87,6 +87,14 @@ DATABASES = {
     }
 }
 
+# A per-statement ceiling for the web process only, set from wsgi.py. The
+# analysis commands share this settings file and legitimately run long scans,
+# so the default here is no limit.
+_stmt_timeout = os.environ.get("GTFSOBS_STATEMENT_TIMEOUT_MS")
+if _stmt_timeout:
+    DATABASES["default"]["OPTIONS"] = {
+        "options": f"-c statement_timeout={int(_stmt_timeout)}"}
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 

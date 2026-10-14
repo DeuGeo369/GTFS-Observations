@@ -12,5 +12,8 @@ import os
 from django.core.wsgi import get_wsgi_application
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'observatory.settings')
+# Web requests only: no page should hold a query open for longer than a minute.
+# manage.py never imports this module, so the analysis commands are unaffected.
+os.environ.setdefault('GTFSOBS_STATEMENT_TIMEOUT_MS', '60000')
 
 application = get_wsgi_application()

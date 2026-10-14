@@ -19,10 +19,12 @@ import traceback
 from datetime import timedelta
 
 from django.contrib.gis.db.models.functions import Transform
+from django.db import connection
 from django.db.models import Avg, Count, Sum
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
+from django.views.decorators.cache import cache_page
 
 from reliability.models import (DailyHeadway, Observation, Poll,
                                 SegmentPerformance)
@@ -202,6 +204,18 @@ def segments_geojson(request):
             status=500)
 
 
+def _estimated_rows(model):
+    """Row count from planner statistics, refreshed by autovacuum and ANALYZE.
+
+    reltuples is -1 for a table never analysed, hence the floor at zero.
+    """
+    with connection.cursor() as c:
+        c.execute("SELECT reltuples::bigint FROM pg_class WHERE oid = %s::regclass",
+                  [model._meta.db_table])
+        return max(0, int(c.fetchone()[0]))
+
+
+@cache_page(600)
 def summary_json(request):
     """Headline figures plus the coverage statement.
 
@@ -244,9 +258,13 @@ def summary_json(request):
             "end": window.window_end if window else None,
         },
         "volume": {
-            "observations_stored": Observation.objects.count(),
-            "trips": Observation.objects.values("trip_id").distinct().count(),
-            "routes": Observation.objects.values("route_id").distinct().count(),
+            # Nothing here may scan the observation table: it is tens of
+            # millions of rows on the server, and an exact count or a distinct
+            # over it ran for close to an hour. The planner estimate is good to
+            # within autovacuum's last pass, and routes come from the rollup.
+            "observations_stored": _estimated_rows(Observation),
+            "routes": SegmentPerformance.objects.values(
+                "route_id").distinct().count(),
         },
         "performance": {
             "segments_usable": segs.count(),

@@ -21,6 +21,8 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get(
     "DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
 # Only hostnames belong here, not bare IP addresses - Django rejects an origin
 # without a scheme, and a raw IP cannot hold a certificate anyway.
 CSRF_TRUSTED_ORIGINS = [
